@@ -68,8 +68,8 @@ app.post("/upload-externo", upload.array("files"), async (req, res) => {
       });
     }
 
-    const categoriaNome = fullPathParts[0].toLowerCase().trim();
-    const planoNome = fullPathParts[1].toLowerCase().trim();
+    const categoriaNome = fullPathParts[0].trim();
+    const planoNome = fullPathParts[1].trim();
     const inscricaoPath = fullPathParts[2];
 
     console.log("categoriaNome", categoriaNome);
@@ -126,6 +126,8 @@ app.post("/upload-externo", upload.array("files"), async (req, res) => {
       }
     }
 
+    await atualizarCacheDepoisMudanca();
+
     return res.json({
       success: erros.length === 0,
       path: normalizedPath,
@@ -133,7 +135,6 @@ app.post("/upload-externo", upload.array("files"), async (req, res) => {
       arquivos: arquivosSalvos,
       errors: erros,
     });
-    console.log(res);
   } catch (err) {
     console.error("Erro real:", err.message);
 
@@ -183,9 +184,8 @@ let cacheResultado = null;
 let carregando = false;
 
 async function carregarCache() {
-  if (carregando) {
-    console.log("Já está carregando, ignorando...");
-    return;
+  while (carregando) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
   }
 
   try {
@@ -246,8 +246,13 @@ async function lerHD() {
           continue;
         }
 
-        const numeroInscricao = match[1];
-        const nome = inscricao.replace(numeroInscricao, "").trim();
+        const regex = /^(\d+)\s*-?\s*(.*)$/;
+
+        const partes = inscricao.match(regex);
+
+        const numeroInscricao = partes?.[1] || null;
+
+        const nome = partes?.[2]?.trim() || null;
 
         const arquivos = (await fs.readdir(inscricaoPath)).filter(
           (file) => file !== "Thumbs.db",
@@ -256,6 +261,7 @@ async function lerHD() {
         resultado.push({
           categoria,
           plano,
+          full_name_paste: inscricao,
           inscricao: numeroInscricao,
           nome,
           arquivos,
@@ -274,6 +280,7 @@ app.get("/sync-hd", async (req, res) => {
 
   if (!cacheResultado || cacheResultado.length === 0) {
     return res.status(503).json({
+      message: "Cache ainda carregando",
       error: "Cache ainda carregando",
     });
   }
@@ -284,6 +291,224 @@ app.get("/sync-hd", async (req, res) => {
 
   res.json(paginado);
 });
+
+//PROCURA INSCRIÇÃO NO HD
+app.get("/check-inscricao/:inscricao", async (req, res) => {
+  try {
+    const { inscricao } = req.params;
+
+    console.log("CACHE SIZE:", cacheResultado?.length);
+    console.log("PROCURANDO:", inscricao);
+
+    if (!cacheResultado) {
+      return res.status(503).json({
+        message: "Cache ainda carregando",
+      });
+    }
+
+    const encontrados = cacheResultado.filter((item) => {
+      return item.inscricao === inscricao;
+    });
+
+    console.log("ENCONTRADOS:", encontrados.length);
+
+    const contracts = encontrados.map((item) => ({
+      categoria: item.categoria,
+      plano: item.plano,
+      inscricao: item.inscricao,
+      full_name_paste: item.full_name_paste,
+      full_path: `${item.categoria}/${item.plano}/${item.full_name_paste}`,
+      arquivos: item.arquivos,
+    }));
+
+    return res.json({
+      exists: true,
+      contracts,
+    });
+  } catch (err) {
+    console.error("check-inscricao error:", err);
+
+    return res.status(500).json({
+      message: "Erro ao procurar inscrição",
+    });
+  }
+});
+
+//MOVER PASTA
+app.post("/move-folder", async (req, res) => {
+  try {
+    const { oldPath, newPath } = req.body || {};
+
+    if (!oldPath || !newPath) {
+      return res.status(400).json({
+        message: "oldPath e newPath obrigatórios",
+      });
+    }
+
+    if (oldPath.includes("..") || newPath.includes("..")) {
+      return res.status(400).json({
+        message: "Path inválido",
+      });
+    }
+
+    const oldFolder = path.join(caminhoBase, oldPath);
+    const newFolder = path.join(caminhoBase, newPath);
+
+    console.log("MOVE REQUEST", {
+      oldPath,
+      newPath,
+    });
+
+    if (!fsSync.existsSync(oldFolder)) {
+      return res.status(404).json({
+        message: "Pasta origem não encontrada",
+      });
+    }
+
+    await fs.mkdir(path.dirname(newFolder), {
+      recursive: true,
+    });
+
+    if (oldFolder !== newFolder) {
+      await fs.rename(oldFolder, newFolder);
+    }
+
+    await atualizarCacheDepoisMudanca();
+
+    return res.json({
+      success: true,
+    });
+  } catch (err) {
+    console.error("move-folder error:", err);
+
+    return res.status(500).json({
+      message: "Erro ao mover pasta",
+    });
+  }
+});
+
+//LISTAR ARQUIVOS
+app.get("/list-files", async (req, res) => {
+  try {
+    const { path: relPath } = req.query;
+
+    if (!relPath) {
+      return res.status(400).json({
+        error: "path obrigatório",
+      });
+    }
+
+    const fullPath = path.join(caminhoBase, relPath);
+
+    if (relPath.includes("..")) {
+      return res.status(400).json({
+        error: "Path inválido",
+      });
+    }
+
+    if (!fsSync.existsSync(fullPath)) {
+      return res.status(404).json({
+        error: "Pasta não encontrada",
+      });
+    }
+
+    const files = await fs.readdir(fullPath);
+
+    const result = files
+      .filter((f) => f !== "Thumbs.db")
+      .map((f) => ({
+        name: f,
+        path: path.join(relPath, f).replace(/\\/g, "/"),
+      }));
+
+    return res.json({
+      files: result,
+    });
+  } catch (err) {
+    console.error("list-files error:", err);
+
+    return res.status(500).json({
+      error: "Erro ao listar arquivos",
+    });
+  }
+});
+
+//UPLOAD DE NOVOS ARQUIVOS
+app.post("/upload-files", upload.array("files"), async (req, res) => {
+  let arquivosTemporarios = [];
+
+  try {
+    const { path: relPath } = req.body;
+
+    if (!relPath) {
+      return res.status(400).json({
+        error: "path obrigatório",
+      });
+    }
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
+        error: "Nenhum arquivo enviado",
+      });
+    }
+
+    arquivosTemporarios = req.files.map((f) => f.path);
+
+    const finalDir = path.join(caminhoBase, relPath);
+
+    if (!fsSync.existsSync(finalDir)) {
+      await fs.mkdir(finalDir, {
+        recursive: true,
+      });
+    }
+
+    const arquivos = [];
+
+    for (const file of req.files) {
+      const ext = path.extname(file.originalname).toLowerCase();
+
+      const fileName = `${randomUUID()}${ext}`;
+
+      const finalPath = path.join(finalDir, fileName);
+
+      if (!fsSync.existsSync(finalPath)) {
+        await fs.copyFile(file.path, finalPath);
+      }
+
+      arquivos.push({
+        original: file.originalname,
+        salvo: fileName,
+        path: path.join(relPath, fileName).replace(/\\/g, "/"),
+      });
+    }
+
+    return res.json({
+      success: true,
+      files: arquivos,
+    });
+  } catch (err) {
+    console.error("upload-files error:", err);
+
+    return res.status(500).json({
+      error: "Erro ao enviar arquivos",
+    });
+  } finally {
+    for (const filePath of arquivosTemporarios) {
+      try {
+        await fs.unlink(filePath);
+      } catch {}
+    }
+  }
+});
+
+async function atualizarCacheDepoisMudanca() {
+  try {
+    await carregarCache();
+    console.log("Cache atualizado após mudança");
+  } catch (err) {
+    console.error("Erro ao atualizar cache:", err);
+  }
+}
 
 const dois_dias = 1000 * 60 * 60 * 24 * 2;
 
